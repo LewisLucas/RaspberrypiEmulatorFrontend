@@ -1,0 +1,43 @@
+# Sample configuration for rpi_emulator_frontend
+# Maps system folder names (top-level folders under your roms/ root) to emulator program and arguments.
+
+# If true, systems that exist in the config but currently have no ROM files will still be shown
+# in the UI. Default: false (hide empty systems).
+show_empty_systems = false
+
+# Default command used when a system does not have an explicit mapping (optional)
+default = { program = "mgba-qt", args = ["{rom}"] }
+
+# Optional: default roms path used when you don't pass a path on the command line.
+# If set, the frontend will use this path when launching without arguments.
+# default_roms_path = "/home/pi/roms"
+
+# Optional: font path to a TTF file. If set, the frontend will use this font instead of
+# trying common system fonts or the FONT_PATH environment variable.
+# font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+[systems]
+# Game Boy Advance / Game Boy Color / Game Boy (system = folder name under roms/)
+gba = { program = "mgba-qt", args = ["{rom}"], visible_extensions = ["gba", "GBA"] }
+gb = { program = "mgba-qt", args = ["{rom}"], visible_extensions = ["gb"] }
+ps2 = { program = "pcsx2", args = ["{rom} -fullscreen"], visible_extensions = ["chd", "iso", "bin"] }
+psx = { program = "pcsx2", args = ["{rom}"], visible_extensions = ["chd", "bin", "iso"] }
+
+# Example for overlapping extensions between systems (both may support .chd)
+# You can explicitly list extensions associated with a system. When launching, the frontend
+# prefers the system determined by folder; if no system mapping is found, it will try to
+# locate a system that lists the file's extension. Order of systems in this file determines
+# priority for extension-based resolution.
+# ps1 = { program = "pcsx1", args = ["{rom}"], extensions = ["chd"] }
+# ps2 = { program = "pcsx2", args = ["{rom}"], extensions = ["chd"] }
+
+# To control which files are visible in the UI for a given system, you can provide
+# `visible_extensions` for each system. If present, only files whose extension appears
+# in this list will be shown under that system. If omitted, all files under the system
+# folder are shown (except ignored archive extensions).
+# Example:
+# gba = { program = "mgba-qt", args = ["{rom}"], visible_extensions = ["gba","bin"] }
+
+# Note: compressed archive files (zip/7z/rar) are ignored by the frontend. If you store ROMs
+# inside archives, extract them first. Files directly in the roms/ root are ignored unless you
+# create and configure a corresponding system for them.

@@ -1,0 +1,17 @@
+[package]
+name = "rpi_emulator_frontend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# enable ttf feature for text rendering
+sdl2 = { version = "0.34", features = ["ttf"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.7"
+dirs = "4"
+x11 = { version = "2.18.2", optional = true }
+
+[features]
+# opt-in global hotkey support (requires system X11 dev libs)
+default = []
+x11 = ["dep:x11"]
