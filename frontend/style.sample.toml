@@ -1,0 +1,36 @@
+# Sample style configuration for rpi_emulator_frontend
+# Drop this file into ~/.config/rpi_emulator_frontend/style.toml or let the
+# application write a default copy on first run. Edit RGB values (0-255)
+
+# Background of the application
+background = [12, 12, 12]
+
+# ROM list tile colors
+tile_selected = [200, 180, 50]
+tile_normal = [60, 60, 60]
+
+# Primary and secondary text colors
+text_primary = [240, 240, 240]
+text_secondary = [180, 180, 180]
+
+# Banner (top bar) colors
+banner_bg = [20, 20, 20]
+banner_text = [220, 220, 220]
+emu_text = [180, 180, 180]
+
+# Overlay (used for launching/error/remap) background color and alpha
+overlay_bg = [0, 0, 0]
+overlay_alpha = 200
+
+# Menu overlay colors
+menu_bg = [10, 10, 10]
+menu_box = [40, 40, 40]
+menu_selected = [80, 80, 80]
+menu_title = [230, 230, 230]
+menu_text = [220, 220, 220]
+
+# Error/message overlay alpha values
+error_overlay_alpha = 200
+message_overlay_alpha = 160
+
+# Example: change tile_selected to [50,200,150] for a teal highlight

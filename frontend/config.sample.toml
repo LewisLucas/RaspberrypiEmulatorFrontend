@@ -10,11 +10,11 @@ default = { program = "mgba-qt", args = ["{rom}"] }
 
 # Optional: default roms path used when you don't pass a path on the command line.
 # If set, the frontend will use this path when launching without arguments.
-# default_roms_path = "/home/pi/roms"
+default_roms_path = "/mnt/emulators/Roms"
 
 # Optional: font path to a TTF file. If set, the frontend will use this font instead of
 # trying common system fonts or the FONT_PATH environment variable.
-# font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 [systems]
 # Game Boy Advance / Game Boy Color / Game Boy (system = folder name under roms/)
