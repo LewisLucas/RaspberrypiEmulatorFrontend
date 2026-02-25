@@ -1,3 +1,9 @@
+mod config;
+mod emu;
+mod scan;
+mod style;
+mod ui;
+
 use sdl2::controller::Button as CButton;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
@@ -6,13 +12,11 @@ use sdl2::rect::Rect;
 use sdl2::render::Texture;
 use sdl2::ttf::Sdl2TtfContext;
 use sdl2::video::FullscreenType;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 #[cfg(feature = "x11")]
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 #[cfg(feature = "x11")]
 use std::ptr;
 use std::sync::mpsc;
@@ -22,425 +26,12 @@ use std::time::Instant;
 #[cfg(feature = "x11")]
 use x11::xlib;
 
+use crate::config::{load_config, user_config_path, write_config};
+use crate::emu::spawn_emulator_template;
+use crate::scan::{find_system_for_extension, scan_grouped};
+use crate::style::load_style;
+
 const TILE_H: i32 = 140;
-
-fn scan_grouped(root: &Path, cfg: &ConfigFile) -> HashMap<String, Vec<PathBuf>> {
-    // group files by the top-level folder under root: roms/<system>/...
-    let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    let ignored_exts = ["zip", "7z", "rar", "gz", "xz"];
-
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(cur) = stack.pop() {
-        if let Ok(entries) = cur.read_dir() {
-            for e in entries.flatten() {
-                let p = e.path();
-                match e.file_type() {
-                    Ok(ft) if ft.is_dir() => stack.push(p),
-                    Ok(ft) if ft.is_file() => {
-                        // ignore archive files
-                        if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                            if ignored_exts.contains(&ext.to_lowercase().as_str()) {
-                                continue;
-                            }
-                        }
-                        if let Ok(rel) = p.strip_prefix(root) {
-                            let mut iter = rel.iter();
-                            if let Some(first) = iter.next() {
-                                if let Some(sys) = first.to_str() {
-                                    let sys_l = sys.to_lowercase();
-                                    // only include if systems are configured and contain this key
-                                    if let Some(systems) = cfg.systems.as_ref() {
-                                        if let Some(tmpl) = systems.get(&sys_l) {
-                                            // if visible_extensions is set, only include matching extensions
-                                            if let Some(visible) = tmpl.visible_extensions.as_ref()
-                                            {
-                                                if let Some(ext) =
-                                                    p.extension().and_then(|s| s.to_str())
-                                                {
-                                                    if visible.iter().any(|e| {
-                                                        e.to_lowercase() == ext.to_lowercase()
-                                                    }) {
-                                                        groups
-                                                            .entry(sys_l)
-                                                            .or_default()
-                                                            .push(p.clone());
-                                                    }
-                                                }
-                                            } else {
-                                                groups.entry(sys_l).or_default().push(p.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    // sort file lists for each system
-    for v in groups.values_mut() {
-        v.sort();
-    }
-    groups
-}
-
-fn find_system_for_extension(
-    ext: &str,
-    cfg: &ConfigFile,
-    systems_order: &Vec<String>,
-) -> Option<String> {
-    let ext_l = ext.to_lowercase();
-    if let Some(systems) = cfg.systems.as_ref() {
-        for sys in systems_order.iter() {
-            if let Some(tmpl) = systems.get(sys) {
-                if let Some(exts) = tmpl.extensions.as_ref() {
-                    for e in exts.iter() {
-                        if e.to_lowercase() == ext_l {
-                            return Some(sys.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct CmdTemplate {
-    program: String,
-    args: Vec<String>,
-    extensions: Option<Vec<String>>,
-    visible_extensions: Option<Vec<String>>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ConfigFile {
-    default: Option<CmdTemplate>,
-    systems: Option<HashMap<String, CmdTemplate>>,
-    show_empty_systems: Option<bool>,
-    controller_map: Option<HashMap<String, String>>,
-    default_roms_path: Option<String>,
-    font_path: Option<String>,
-}
-
-fn user_config_path() -> Option<std::path::PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        let mut p = PathBuf::from(xdg);
-        p.push("rpi_emulator_frontend");
-        p.push("config.toml");
-        Some(p)
-    } else if let Some(home) = dirs::home_dir() {
-        let mut p = home;
-        p.push(".config/rpi_emulator_frontend/config.toml");
-        Some(p)
-    } else {
-        None
-    }
-}
-
-fn write_default_config(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Prefer a project-level config_template.toml in the current working directory if present.
-    // This allows developers to provide a template at the repo root which will be copied to the
-    // user's config location on first run. If not present, fall back to the built-in sample.
-    let sample = if let Ok(template) = std::fs::read_to_string("config_template.toml") {
-        template
-    } else {
-        include_str!("../config.sample.toml").to_string()
-    };
-
-    // atomic write
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, sample.as_bytes())?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-fn load_config() -> ConfigFile {
-    // default in-memory config if file missing
-    let mut cfg = ConfigFile {
-        default: Some(CmdTemplate {
-            program: "mgba-qt".to_string(),
-            args: vec!["{rom}".to_string()],
-            extensions: None,
-            visible_extensions: None,
-        }),
-        systems: None,
-        show_empty_systems: Some(false),
-        controller_map: None,
-        default_roms_path: None,
-        font_path: None,
-    };
-    if let Some(p) = user_config_path() {
-        if !p.exists() {
-            // write default sample for user to edit
-            if let Err(e) = write_default_config(&p) {
-                eprintln!("Failed to write default config: {}", e);
-            }
-        }
-        if let Ok(contents) = std::fs::read_to_string(&p) {
-            if let Ok(parsed) = toml::from_str::<ConfigFile>(&contents) {
-                // merge into cfg
-                if parsed.default.is_some() {
-                    cfg.default = parsed.default;
-                }
-                if parsed.systems.is_some() {
-                    cfg.systems = parsed.systems;
-                }
-                if parsed.show_empty_systems.is_some() {
-                    cfg.show_empty_systems = parsed.show_empty_systems;
-                }
-                if parsed.controller_map.is_some() {
-                    cfg.controller_map = parsed.controller_map;
-                }
-                if parsed.default_roms_path.is_some() {
-                    cfg.default_roms_path = parsed.default_roms_path;
-                }
-                if parsed.font_path.is_some() {
-                    cfg.font_path = parsed.font_path;
-                }
-            } else {
-                eprintln!("Failed to parse config at {}", p.display());
-            }
-        }
-    }
-    cfg
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct StyleConfig {
-    background: Option<[u8; 3]>,
-    tile_selected: Option<[u8; 3]>,
-    tile_normal: Option<[u8; 3]>,
-    text_primary: Option<[u8; 3]>,
-    text_secondary: Option<[u8; 3]>,
-    banner_bg: Option<[u8; 3]>,
-    banner_text: Option<[u8; 3]>,
-    emu_text: Option<[u8; 3]>,
-    overlay_bg: Option<[u8; 3]>,
-    overlay_alpha: Option<u8>,
-    menu_bg: Option<[u8; 3]>,
-    menu_box: Option<[u8; 3]>,
-    menu_selected: Option<[u8; 3]>,
-    menu_title: Option<[u8; 3]>,
-    menu_text: Option<[u8; 3]>,
-    error_overlay_alpha: Option<u8>,
-    message_overlay_alpha: Option<u8>,
-}
-
-fn user_style_path() -> Option<std::path::PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        let mut p = PathBuf::from(xdg);
-        p.push("rpi_emulator_frontend");
-        p.push("style.toml");
-        Some(p)
-    } else if let Some(home) = dirs::home_dir() {
-        let mut p = home;
-        p.push(".config/rpi_emulator_frontend/style.toml");
-        Some(p)
-    } else {
-        None
-    }
-}
-
-fn write_default_style(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // prefer a project-level style.sample.toml if present
-    let sample = if let Ok(s) = std::fs::read_to_string("style.sample.toml") {
-        s
-    } else {
-        include_str!("../style.sample.toml").to_string()
-    };
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, sample.as_bytes())?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-fn load_style() -> StyleConfig {
-    // defaults hard-coded if file missing or parse fails
-    let mut s = StyleConfig {
-        background: Some([12, 12, 12]),
-        tile_selected: Some([200, 180, 50]),
-        tile_normal: Some([60, 60, 60]),
-        text_primary: Some([240, 240, 240]),
-        text_secondary: Some([180, 180, 180]),
-        banner_bg: Some([20, 20, 20]),
-        banner_text: Some([220, 220, 220]),
-        emu_text: Some([180, 180, 180]),
-        overlay_bg: Some([0, 0, 0]),
-        overlay_alpha: Some(200),
-        menu_bg: Some([10, 10, 10]),
-        menu_box: Some([40, 40, 40]),
-        menu_selected: Some([80, 80, 80]),
-        menu_title: Some([230, 230, 230]),
-        menu_text: Some([220, 220, 220]),
-        error_overlay_alpha: Some(200),
-        message_overlay_alpha: Some(160),
-    };
-
-    if let Some(p) = user_style_path() {
-        if !p.exists() {
-            if let Err(e) = write_default_style(&p) {
-                eprintln!("Failed to write default style: {}", e);
-            }
-        }
-        if let Ok(contents) = std::fs::read_to_string(&p) {
-            if let Ok(parsed) = toml::from_str::<StyleConfig>(&contents) {
-                // merge parsed into s
-                if parsed.background.is_some() {
-                    s.background = parsed.background;
-                }
-                if parsed.tile_selected.is_some() {
-                    s.tile_selected = parsed.tile_selected;
-                }
-                if parsed.tile_normal.is_some() {
-                    s.tile_normal = parsed.tile_normal;
-                }
-                if parsed.text_primary.is_some() {
-                    s.text_primary = parsed.text_primary;
-                }
-                if parsed.text_secondary.is_some() {
-                    s.text_secondary = parsed.text_secondary;
-                }
-                if parsed.banner_bg.is_some() {
-                    s.banner_bg = parsed.banner_bg;
-                }
-                if parsed.banner_text.is_some() {
-                    s.banner_text = parsed.banner_text;
-                }
-                if parsed.emu_text.is_some() {
-                    s.emu_text = parsed.emu_text;
-                }
-                if parsed.overlay_bg.is_some() {
-                    s.overlay_bg = parsed.overlay_bg;
-                }
-                if parsed.overlay_alpha.is_some() {
-                    s.overlay_alpha = parsed.overlay_alpha;
-                }
-                if parsed.menu_bg.is_some() {
-                    s.menu_bg = parsed.menu_bg;
-                }
-                if parsed.menu_box.is_some() {
-                    s.menu_box = parsed.menu_box;
-                }
-                if parsed.menu_selected.is_some() {
-                    s.menu_selected = parsed.menu_selected;
-                }
-                if parsed.menu_title.is_some() {
-                    s.menu_title = parsed.menu_title;
-                }
-                if parsed.menu_text.is_some() {
-                    s.menu_text = parsed.menu_text;
-                }
-                if parsed.error_overlay_alpha.is_some() {
-                    s.error_overlay_alpha = parsed.error_overlay_alpha;
-                }
-                if parsed.message_overlay_alpha.is_some() {
-                    s.message_overlay_alpha = parsed.message_overlay_alpha;
-                }
-            } else {
-                eprintln!("Failed to parse style at {}", p.display());
-            }
-        }
-    }
-
-    s
-}
-
-fn write_config(cfg: &ConfigFile) -> Result<(), String> {
-    if let Some(p) = user_config_path() {
-        if let Some(parent) = p.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return Err(format!("Failed to create config dir: {}", e));
-            }
-        }
-        match toml::to_string_pretty(cfg) {
-            Ok(s) => {
-                let tmp = p.with_extension("toml.tmp");
-                if let Err(e) = std::fs::write(&tmp, s.as_bytes()) {
-                    return Err(format!("Failed writing tmp config: {}", e));
-                }
-                if let Err(e) = std::fs::rename(&tmp, &p) {
-                    return Err(format!("Failed renaming config: {}", e));
-                }
-                return Ok(());
-            }
-            Err(e) => return Err(format!("Failed to serialize config: {}", e)),
-        }
-    }
-    Err("No config path available".into())
-}
-
-// deprecated helper removed
-
-fn spawn_emulator_template(
-    tmpl: &CmdTemplate,
-    rom: &Path,
-    child_slot: Arc<Mutex<Option<std::process::Child>>>,
-) {
-    let mut cmd = Command::new(&tmpl.program);
-    let mut args: Vec<std::ffi::OsString> = Vec::new();
-    for a in &tmpl.args {
-        if a == "{rom}" {
-            args.push(rom.as_os_str().to_owned());
-        } else {
-            args.push(std::ffi::OsString::from(a));
-        }
-    }
-    cmd.args(&args);
-    match cmd.spawn() {
-        Ok(child) => {
-            println!("Launched {} with pid={}", tmpl.program, child.id());
-            // place child into shared slot
-            {
-                let mut slot = child_slot.lock().unwrap();
-                *slot = Some(child);
-            }
-
-            // wait using polling so other threads can lock and kill
-            loop {
-                // check child status
-                {
-                    let mut slot = child_slot.lock().unwrap();
-                    if let Some(ref mut c) = slot.as_mut() {
-                        match c.try_wait() {
-                            Ok(Some(status)) => {
-                                println!("Emulator exited with {:?}", status);
-                                // remove from slot
-                                slot.take();
-                                break;
-                            }
-                            Ok(None) => {
-                                // still running
-                            }
-                            Err(e) => {
-                                eprintln!("Child try_wait error: {}", e);
-                                slot.take();
-                                break;
-                            }
-                        }
-                    } else {
-                        // no child present
-                        break;
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(150));
-            }
-            println!("Emulator exited");
-        }
-        Err(e) => eprintln!("Failed to spawn emulator {}: {}", tmpl.program, e),
-    }
-}
 
 fn main() -> Result<(), String> {
     let roms_arg = env::args().nth(1);
@@ -649,24 +240,18 @@ fn main() -> Result<(), String> {
     }
 
     let mut event_pump = sdl_ctx.event_pump()?;
+    // controller combo tracking: record button press times
+    use std::collections::HashMap as Map;
+    let mut pressed_buttons: Map<CButton, Instant> = Map::new();
+    let combo_window = std::time::Duration::from_millis(400);
+    let combo_cooldown = std::time::Duration::from_secs(1);
+    let mut last_combo = Instant::now() - combo_cooldown;
     let mut selected: usize = 0;
     let mut scroll_offset: usize = 0;
     let mut launching = false;
     let mut is_fullscreen = true;
-    // menu state
-    #[derive(PartialEq)]
-    enum MenuState {
-        Closed,
-        Open {
-            items: Vec<String>,
-            selected: usize,
-        },
-        Remap {
-            actions: Vec<String>,
-            idx: usize,
-            temp_map: HashMap<String, String>,
-        },
-    }
+    // menu state (moved to ui module)
+    use crate::ui::MenuState;
     let mut menu_state = MenuState::Closed;
     let mut menu_message: Option<(String, Instant)> = None;
     let mut should_quit = false;
@@ -724,21 +309,63 @@ fn main() -> Result<(), String> {
                     println!("Menu opened (key C)");
                 }
                 // allow opening the menu with the controller Start button even when other guards exist
-                Event::ControllerButtonDown {
-                    button: CButton::Start,
-                    ..
-                } => {
-                    let items = vec![
-                        "Toggle show_empty_systems".to_string(),
-                        "Remap controls".to_string(),
-                        "Reload config".to_string(),
-                        "Save config".to_string(),
-                        "Close".to_string(),
-                        "Exit".to_string(),
-                    ];
-                    menu_state = MenuState::Open { items, selected: 0 };
-                    let _ = canvas.window_mut().raise();
-                    println!("Menu opened (controller Start)");
+                Event::ControllerButtonDown { button, .. } => {
+                    // record press time for combo detection
+                    pressed_buttons.insert(button, Instant::now());
+                    // if button released events are not received we clear entries via timeout elsewhere
+                    // check kill combo (Start + LeftShoulder + RightShoulder) within window
+                    if last_combo.elapsed() >= combo_cooldown {
+                        if pressed_buttons.contains_key(&CButton::Start)
+                            && pressed_buttons.contains_key(&CButton::LeftShoulder)
+                            && pressed_buttons.contains_key(&CButton::RightShoulder)
+                        {
+                            // ensure presses happened within combo_window
+                            let times: Vec<_> = [
+                                CButton::Start,
+                                CButton::LeftShoulder,
+                                CButton::RightShoulder,
+                            ]
+                            .iter()
+                            .filter_map(|b| pressed_buttons.get(b))
+                            .cloned()
+                            .collect();
+                            if times.len() == 3 {
+                                let min = times.iter().min().unwrap();
+                                let max = times.iter().max().unwrap();
+                                if max.duration_since(*min) <= combo_window {
+                                    // trigger kill
+                                    last_combo = Instant::now();
+                                    match emu::kill_current_emulator(&current_child) {
+                                        Ok(m) => {
+                                            menu_message = Some((m, Instant::now()));
+                                            launching = false;
+                                        }
+                                        Err(e) => {
+                                            menu_message = Some((
+                                                format!("Kill failed: {}", e),
+                                                Instant::now(),
+                                            ));
+                                        }
+                                    }
+                                    pressed_buttons.clear();
+                                }
+                            }
+                        }
+                    }
+                    // existing Start-open-menu behavior preserved below when matched
+                    if button == CButton::Start {
+                        let items = vec![
+                            "Toggle show_empty_systems".to_string(),
+                            "Remap controls".to_string(),
+                            "Reload config".to_string(),
+                            "Save config".to_string(),
+                            "Close".to_string(),
+                            "Exit".to_string(),
+                        ];
+                        menu_state = MenuState::Open { items, selected: 0 };
+                        let _ = canvas.window_mut().raise();
+                        println!("Menu opened (controller Start)");
+                    }
                 }
                 // joystick button events: map Start (common idx 7) to open menu; otherwise handle as joystick buttons
                 Event::JoyButtonDown { button_idx, .. } => {
@@ -798,6 +425,10 @@ fn main() -> Result<(), String> {
                             _ => {}
                         }
                     }
+                }
+                Event::ControllerButtonUp { button, .. } => {
+                    // remove from pressed set
+                    pressed_buttons.remove(&button);
                 }
                 // Escape: close menu if open, otherwise quit
                 Event::KeyDown {
@@ -1164,344 +795,66 @@ fn main() -> Result<(), String> {
             }
         }
 
-        // render
-        canvas.set_draw_color(bg_color);
-        canvas.clear();
-
-        // list layout (single column). compute tile sizes and visible window
-        let padding = 10;
-        let start_x = padding;
-        let start_y = padding + 44; // leave space for banner
-        let tile_w = (w as i32) - (padding * 2);
-        let tile_h = TILE_H;
-
-        let available_h = (h as i32) - start_y - padding;
-        let visible = (available_h / (tile_h + padding)).max(1) as usize;
-
-        // ensure scroll offset valid
-        if scroll_offset >= current_roms.len() && !current_roms.is_empty() {
-            scroll_offset = current_roms.len() - 1;
-        }
-
-        for (idx, rom) in current_roms
-            .iter()
-            .enumerate()
-            .skip(scroll_offset)
-            .take(visible)
+        // render main frame (list, banner, overlays)
         {
-            let i = idx;
-            let x = start_x;
-            let y = start_y + ((i - scroll_offset) as i32) * (tile_h + padding);
-            let rect = Rect::new(x, y, tile_w as u32, tile_h as u32);
-
-            if i == selected {
-                canvas.set_draw_color(tile_selected_c);
-            } else {
-                canvas.set_draw_color(tile_normal_c);
-            }
-            let _ = canvas.fill_rect(rect);
-
-            // filename text rendering (lazy create texture)
-            if text_textures.get(i).and_then(|t| t.as_ref()).is_none() {
-                if let Some(name) = rom.file_name().and_then(|s| s.to_str()) {
-                    // Render filename into up to 2 lines. If too long, truncate the second line with ellipsis.
-                    let padding = 8; // px padding inside tile
-                                     // use current list tile width, not the old TILE_W constant
-                    let max_w = (tile_w as u32).saturating_sub((padding * 2) as u32);
-
-                    // Helper to measure width using the font
-                    let width_of =
-                        |s: &str| -> u32 { font.size_of(s).map(|(w, _)| w).unwrap_or(0) };
-
-                    // If fits in one line, use that
-                    if width_of(name) <= max_w {
-                        if let Ok(surface) = font.render(name).blended(text_primary_c) {
-                            if let Ok(tex) = texture_creator.create_texture_from_surface(&surface) {
-                                if let Some(slot) = text_textures.get_mut(i) {
-                                    *slot = Some(vec![tex]);
-                                }
-                            }
-                        }
-                    } else {
-                        // find maximal prefix that fits on first line (binary search)
-                        let chars: Vec<char> = name.chars().collect();
-                        let mut lo = 0usize;
-                        let mut hi = chars.len();
-                        while lo < hi {
-                            let mid = (lo + hi + 1) / 2;
-                            let cand: String = chars.iter().take(mid).collect();
-                            if width_of(&cand) <= max_w {
-                                lo = mid;
-                            } else {
-                                hi = mid - 1;
-                            }
-                        }
-                        let mut first: String = chars.iter().take(lo).collect();
-                        let remaining: String = chars.iter().skip(lo).collect();
-
-                        // Try to smart-split at the last separator within the first line
-                        let seps = [' ', '-', ':', '_'];
-                        if let Some(pos) = first.rfind(|c: char| seps.contains(&c)) {
-                            // split at separator pos (exclude separator)
-                            let new_first: String = first.chars().take(pos).collect();
-                            if !new_first.is_empty() {
-                                // remaining becomes text after separator plus old remaining
-                                let after_sep: String =
-                                    first.chars().skip(pos + 1).collect::<String>() + &remaining;
-                                first = new_first;
-                                // use after_sep as the new remaining
-                                let remaining = after_sep;
-                                // proceed to render second line based on new remaining
-                                // determine second line below using 'remaining'
-                                // For scope reasons we shadow the name 'remaining' by reassigning below via let
-                                let remaining = remaining;
-
-                                // Now create second line from remaining (fits or truncated)
-                                let second = if width_of(&remaining) <= max_w {
-                                    remaining
-                                } else {
-                                    // truncate with ellipsis at end
-                                    let ell = "...";
-                                    let mut lo2 = 0usize;
-                                    let mut hi2 = remaining.chars().count();
-                                    while lo2 < hi2 {
-                                        let mid = (lo2 + hi2 + 1) / 2;
-                                        let cand: String =
-                                            remaining.chars().take(mid).collect::<String>() + ell;
-                                        if width_of(&cand) <= max_w {
-                                            lo2 = mid;
-                                        } else {
-                                            hi2 = mid - 1;
-                                        }
-                                    }
-                                    let kept: String = remaining.chars().take(lo2).collect();
-                                    if kept.is_empty() {
-                                        ell.to_string()
-                                    } else {
-                                        kept + ell
-                                    }
-                                };
-
-                                // render both lines
-                                let mut line_texts: Vec<Texture> = Vec::new();
-                                if let Ok(s1) = font.render(&first).blended(text_primary_c) {
-                                    if let Ok(t1) = texture_creator.create_texture_from_surface(&s1)
-                                    {
-                                        line_texts.push(t1);
-                                    }
-                                }
-                                if let Ok(s2) = font.render(&second).blended(text_primary_c) {
-                                    if let Ok(t2) = texture_creator.create_texture_from_surface(&s2)
-                                    {
-                                        line_texts.push(t2);
-                                    }
-                                }
-                                if let Some(slot) = text_textures.get_mut(i) {
-                                    *slot = Some(line_texts);
-                                }
-                                continue;
-                            }
-                        }
-
-                        // Fallback behavior: second line is remaining, possibly truncated with ellipsis
-                        let second = if width_of(&remaining) <= max_w {
-                            remaining.clone()
-                        } else {
-                            let ell = "...";
-                            let mut lo2 = 0usize;
-                            let mut hi2 = remaining.chars().count();
-                            while lo2 < hi2 {
-                                let mid = (lo2 + hi2 + 1) / 2;
-                                let cand: String =
-                                    remaining.chars().take(mid).collect::<String>() + ell;
-                                if width_of(&cand) <= max_w {
-                                    lo2 = mid;
-                                } else {
-                                    hi2 = mid - 1;
-                                }
-                            }
-                            let kept: String = remaining.chars().take(lo2).collect();
-                            if kept.is_empty() {
-                                ell.to_string()
-                            } else {
-                                kept + ell
-                            }
-                        };
-
-                        // render both lines
-                        let mut line_texts: Vec<Texture> = Vec::new();
-                        if let Ok(s1) = font.render(&first).blended(text_primary_c) {
-                            if let Ok(t1) = texture_creator.create_texture_from_surface(&s1) {
-                                line_texts.push(t1);
-                            }
-                        }
-                        if let Ok(s2) = font.render(&second).blended(text_primary_c) {
-                            if let Ok(t2) = texture_creator.create_texture_from_surface(&s2) {
-                                line_texts.push(t2);
-                            }
-                        }
-                        if let Some(slot) = text_textures.get_mut(i) {
-                            *slot = Some(line_texts);
-                        }
-                    }
-                }
-            }
-
-            if let Some(Some(text_vec)) = text_textures.get(i) {
-                // draw one or two lines centered vertically in the tile
-                let mut total_h = 0i32;
-                let mut queries: Vec<sdl2::render::TextureQuery> = Vec::new();
-                for tex in text_vec.iter() {
-                    let q = tex.query();
-                    total_h += q.height as i32;
-                    queries.push(q);
-                }
-                // spacing between lines
-                let spacing = 2;
-                total_h += spacing * ((queries.len() as i32) - 1).max(0);
-                let mut cursor_y = y + (tile_h - total_h) / 2; // center vertically
-                for (idx, tex) in text_vec.iter().enumerate() {
-                    let q = &queries[idx];
-                    let tex_w = q.width as i32;
-                    let tex_h = q.height as i32;
-                    let dst_x = x + (tile_w - tex_w) / 2;
-                    let dst_y = cursor_y;
-                    let _ = canvas.copy(
-                        tex,
-                        None,
-                        Rect::new(dst_x, dst_y, tex_w as u32, tex_h as u32),
-                    );
-                    cursor_y += tex_h + spacing;
-                }
-            }
-        }
-
-        // banner
-        canvas.set_draw_color(banner_bg_c);
-        let _ = canvas.fill_rect(Rect::new(0, 0, w as u32, 40));
-
-        // render banner text: current system and selected filename + mapped emulator
-        let current_system_name = systems_vec
-            .get(current_system_idx)
-            .cloned()
-            .unwrap_or_else(|| "".to_string());
-        // show system name + count
-        let count = current_roms.len();
-        let system_label = format!("{} ({})", current_system_name.to_uppercase(), count);
-        if let Ok(surf_sys) = font.render(&system_label).blended(banner_text_c) {
-            if let Ok(tex_sys) = texture_creator.create_texture_from_surface(&surf_sys) {
-                let q = tex_sys.query();
-                // position system label at the right side of banner to avoid overlapping centered filename
-                let dst_x = (w as i32) - (q.width as i32) - 12;
-                let dst_y = 8;
-                let _ = canvas.copy(&tex_sys, None, Rect::new(dst_x, dst_y, q.width, q.height));
-            }
-        }
-
-        if let Some(rom_path) = current_roms.get(selected) {
-            if let Some(name) = rom_path.file_name().and_then(|s| s.to_str()) {
-                // emulator mapping name
-                let emu_name = config
-                    .systems
-                    .as_ref()
-                    .and_then(|m| m.get(&current_system_name))
-                    .map(|t| t.program.clone())
-                    .or_else(|| config.default.as_ref().map(|d| d.program.clone()));
-
-                // prepare filename display: if too wide, do middle elide keeping start and end
-                let banner_padding = 12u32;
-                let avail = (w as u32).saturating_sub(banner_padding * 2);
-                let full_name = name.to_string();
-                let display_name = if font.size_of(&full_name).map(|(w, _)| w).unwrap_or(0) <= avail
-                {
-                    full_name.clone()
-                } else {
-                    // middle elide
-                    fn elide_middle(s: &str, max_chars: usize) -> String {
-                        let chars: Vec<char> = s.chars().collect();
-                        if chars.len() <= max_chars {
-                            return s.to_string();
-                        }
-                        if max_chars <= 3 {
-                            return "...".to_string();
-                        }
-                        let keep = (max_chars - 3) / 2;
-                        let head = keep + ((max_chars - 3) % 2);
-                        let tail = keep;
-                        let start: String = chars.iter().take(head).collect();
-                        let end: String = chars
-                            .iter()
-                            .rev()
-                            .take(tail)
-                            .collect::<Vec<&char>>()
-                            .into_iter()
-                            .rev()
-                            .collect();
-                        format!("{}...{}", start, end)
-                    }
-                    // estimate max chars fitting in avail using avg char width of 7
-                    let est = ((avail as f32) / 7.0) as usize;
-                    elide_middle(&full_name, est.max(8))
-                };
-
-                if let Ok(surf) = font.render(&display_name).blended(banner_text_c) {
-                    if let Ok(tex) = texture_creator.create_texture_from_surface(&surf) {
-                        let q = tex.query();
-                        let dst_x = ((w as i32) - q.width as i32) / 2;
-                        let dst_y = 8;
-                        let _ = canvas.copy(&tex, None, Rect::new(dst_x, dst_y, q.width, q.height));
-                    }
-                }
-
-                if let Some(emu) = emu_name {
-                    let emu_txt = format!("emu: {}", emu);
-                    if let Ok(surf2) = font.render(&emu_txt).blended(emu_text_c) {
-                        if let Ok(tex2) = texture_creator.create_texture_from_surface(&surf2) {
-                            let q2 = tex2.query();
-                            let dst_x2 = 12;
-                            let dst_y2 = 10;
-                            let _ = canvas.copy(
-                                &tex2,
-                                None,
-                                Rect::new(dst_x2, dst_y2, q2.width, q2.height),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // launching overlay
-        if launching {
-            canvas.set_draw_color(overlay_rgba);
-            let _ = canvas.fill_rect(Rect::new(0, 0, w as u32, h as u32));
-        }
-
-        // error overlay for missing mapping or spawn errors (auto-hide after 3s)
-        if let Some((ref msg, when)) = error_overlay {
-            if when.elapsed().as_secs() < 3 {
-                canvas.set_draw_color(overlay_rgba);
-                let _ = canvas.fill_rect(Rect::new(0, 0, w as u32, h as u32));
-                // render message centered top
-                if let Ok(surface) = font.render(msg).blended(text_primary_c) {
-                    if let Ok(tex) = texture_creator.create_texture_from_surface(&surface) {
-                        let q = tex.query();
-                        let dst_x = (w as i32 - q.width as i32) / 2;
-                        let dst_y = (h as i32 - q.height as i32) / 2;
-                        let _ = canvas.copy(&tex, None, Rect::new(dst_x, dst_y, q.width, q.height));
-                    }
-                }
-            } else {
-                error_overlay = None;
-            }
+            use crate::ui::{render_frame, UIColors};
+            let colors = UIColors {
+                bg: bg_color,
+                tile_selected: tile_selected_c,
+                tile_normal: tile_normal_c,
+                text_primary: text_primary_c,
+                banner_bg: banner_bg_c,
+                banner_text: banner_text_c,
+                emu_text: emu_text_c,
+                overlay_rgba,
+            };
+            render_frame(
+                &mut canvas,
+                &texture_creator,
+                &font,
+                &colors,
+                &current_roms,
+                &mut text_textures,
+                selected,
+                scroll_offset,
+                current_system_idx,
+                &systems_vec,
+                w as i32,
+                h as i32,
+                launching,
+                &mut error_overlay,
+            );
         }
 
         // present moved after menu rendering so overlays are composed before presenting
 
         // handle menu input and rendering after presenting main content
-        // menu state handling
-        let mut menu_next_state: Option<MenuState> = None;
-        match &mut menu_state {
+        // menu state handling (delegated to ui::process_menu)
+        let (menu_next, menu_msg_opt, menu_quit) = crate::ui::process_menu(
+            &mut canvas,
+            &texture_creator,
+            &font,
+            &mut menu_state,
+            &mut menu_events,
+            &mut config,
+            &mut groups,
+            &mut systems_vec,
+            &mut current_system_idx,
+            &roms_dir,
+            &mut current_roms,
+            &mut text_textures,
+            &mut event_pump,
+        );
+        if let Some(m) = menu_msg_opt {
+            menu_message = Some(m);
+        }
+        if let Some(s) = menu_next {
+            menu_state = s;
+        }
+        if menu_quit {
+            break 'running;
+        }
+        /* match &mut menu_state {
             MenuState::Closed => {}
             MenuState::Open {
                 items,
@@ -1873,6 +1226,7 @@ fn main() -> Result<(), String> {
                 }
             }
         }
+        */
 
         // render menu message overlay if present (auto-hide after 3s)
         if let Some((ref msg, when)) = menu_message {
